@@ -196,7 +196,7 @@ export const signOut = async (req, res, next) => {
 }
 
 
-export const getMe = (req, res) => {
+/*export const getMe = (req, res) => {
     // req.user was attached by authMiddleware, so we can just send it back
     res.json({ success: true, data: { user: req.user } });
-};
+};*/
