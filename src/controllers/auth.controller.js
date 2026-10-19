@@ -2,18 +2,45 @@
 // We never store the real password, only the hash, so a database leak doesn't expose passwords.
 import bcrypt from 'bcryptjs';
 
-// jsonwebtoken: creates and verifies JWTs (the "token" the client sends back on later requests).
-import jwt from 'jsonwebtoken';
-
-// Our User model. In ES modules the ".js" at the end is REQUIRED, otherwise Node can't find the file.
+// Our models. In ES modules the ".js" at the end is REQUIRED, otherwise Node can't find the file.
 import User from '../models/User.js';
+import RefreshToken from '../models/RefreshToken.js';
 
-// Secret key and expiry for tokens, read from your .env file through env.js.
-import { JWT_SECRET, JWT_EXPIRES_IN } from '../config/env.js';
+// CHANGED: we no longer import jsonwebtoken, JWT_SECRET or JWT_EXPIRES_IN here.
+// Creating tokens now lives in utils/tokens.js, so this file just calls those helpers.
+import {
+    signAccessToken,       // makes the short-lived (15 min) JWT
+    createRefreshToken,    // makes the long random refresh token AND saves its hash in MongoDB
+    hashToken,             // hashes a token so we can look it up in MongoDB
+    refreshCookieOptions,  // httpOnly / secure / sameSite / maxAge for the refresh cookie
+    clearCookieOptions,    // the same options without maxAge, used to delete the cookie
+} from '../utils/tokens.js';
 
 // A named constant instead of a "magic number" scattered in the code. Easy to change in one place.
 const MIN_PASSWORD_LENGTH = 8;
 
+// NEW: a small helper used by both signUp and signIn, so we don't write the same 3 lines twice.
+// It creates BOTH tokens, puts the refresh token in a cookie, and returns the access token.
+const issueTokens = async (res, user) => {
+    // Short-lived JWT. The server does not store it, it only verifies it on each request.
+    const accessToken = signAccessToken(user);
+
+    // Long random string, valid for 7 days. Its HASH is saved in the database,
+    // which is what lets us revoke it when the user signs out.
+    const refreshToken = await createRefreshToken(user._id);
+
+    // The refresh token goes in an httpOnly cookie. The browser (or Postman) stores it and
+    // sends it back automatically. JavaScript on the page can't read it, so XSS can't steal it.
+    res.cookie('refreshToken', refreshToken, refreshCookieOptions);
+
+    // The caller puts this in the JSON response. The client sends it back as
+    // "Authorization: Bearer <accessToken>" on protected routes.
+    return accessToken;
+};
+
+// ---------------------------------------------------------------------------
+// SIGN UP
+// ---------------------------------------------------------------------------
 // `async` because we use `await` inside (database + hashing are slow operations).
 // (req, res, next) is the standard middleware shape, a controller is just the last middleware in the chain.
 export const signUp = async (req, res, next) => {
@@ -77,13 +104,9 @@ export const signUp = async (req, res, next) => {
             password: hashedPassword,
         });
 
-        // Build a token that proves "this request comes from this user".
-        // 1st argument: the payload (data stored inside the token). Keep it small, and never put passwords in it.
-        // 2nd argument: your secret key, used to sign the token so nobody can forge one.
-        // 3rd argument: options. expiresIn makes the token stop working after a while (e.g. '1d').
-        const token = jwt.sign({ userId: newUser._id }, JWT_SECRET, {
-            expiresIn: JWT_EXPIRES_IN,
-        });
+        // CHANGED: instead of jwt.sign(...) here, use the helper. The new user is signed in right away,
+        // so they get an access token AND the refresh cookie is set on the response.
+        const accessToken = await issueTokens(res, newUser);
 
         // `select: false` in the model only hides the password when you QUERY (find, findOne...).
         // The document returned by create() still contains it, so we remove it before sending the response.
@@ -92,12 +115,13 @@ export const signUp = async (req, res, next) => {
         delete userData.password;
 
         // 201 = Created (the correct status for "a new resource was made").
-        // The client gets the token and the user's info (without the password).
+        // CHANGED: the key is now `accessToken` (it was `token`) so it's clear which token this is.
+        // The refresh token is NOT in the body, it travels in the httpOnly cookie only.
         res.status(201).json({
             success: true,
             message: 'User created successfully',
             data: {
-                token,
+                accessToken,
                 user: userData,
             },
         });
@@ -165,10 +189,8 @@ export const signIn = async (req, res, next) => {
         // without loading and re-saving the whole document.
         await User.updateOne({ _id: user._id }, { lastLoginAt: new Date() });
 
-        // Create the token, exactly like in sign-up: payload, secret, expiry.
-        const token = jwt.sign({ userId: user._id }, JWT_SECRET, {
-            expiresIn: JWT_EXPIRES_IN,
-        });
+        // CHANGED: create both tokens with the helper (access token returned, refresh cookie set on `res`).
+        const accessToken = await issueTokens(res, user);
 
         // The user document still carries the password hash (we asked for it with +password),
         // so convert it to a plain object and delete the password before sending anything to the client.
@@ -180,7 +202,7 @@ export const signIn = async (req, res, next) => {
             success: true,
             message: 'User signed in successfully',
             data: {
-                token,
+                accessToken,
                 user: userData,
             },
         });
@@ -190,13 +212,98 @@ export const signIn = async (req, res, next) => {
     }
 };
 
+// ---------------------------------------------------------------------------
+// REFRESH (NEW)
+// POST /auth/refresh
+// Called when the access token has expired and the client needs a new one.
+// The client sends NO Bearer token here. The refresh token arrives in the cookie.
+// ---------------------------------------------------------------------------
+export const refresh = async (req, res, next) => {
+    try {
+        // Read the refresh token from the cookie. req.cookies exists because of cookie-parser in app.js.
+        // The ?. means "if req.cookies is undefined, give undefined instead of crashing".
+        const token = req.cookies?.refreshToken;
 
+        // typeof check, same idea as the email check above: cookie-parser can turn some cookie values
+        // into objects, and hashing an object would crash. We only accept a plain string.
+        if (typeof token !== 'string') {
+            const error = new Error('No refresh token');
+            error.statusCode = 401;
+            throw error;
+        }
+
+        // Hash the token and look it up. findOneAndDelete finds the record AND removes it in one step,
+        // so every refresh token can only be used ONCE. This is called "rotation":
+        // if a stolen token is used after the real user already used it, it won't be found.
+        const stored = await RefreshToken.findOneAndDelete({ tokenHash: hashToken(token) });
+
+        // Not found (never existed, already used, or signed out), or past its expiry date -> reject.
+        // The TTL index deletes expired records eventually, but not instantly, so we check the date too.
+        if (!stored || stored.expiresAt < new Date()) {
+            const error = new Error('Invalid or expired refresh token');
+            error.statusCode = 401;
+            throw error;
+        }
+
+        // The user may have been deleted or suspended since they signed in, so check again.
+        const user = await User.findOne({ _id: stored.user, deletedAt: null });
+        if (!user) {
+            const error = new Error('User not found');
+            error.statusCode = 401;
+            throw error;
+        }
+        if (user.status === 'suspended') {
+            const error = new Error('This account has been suspended');
+            error.statusCode = 403;
+            throw error;
+        }
+
+        // Issue a fresh pair: a new access token (returned) and a new refresh token (set in the cookie,
+        // replacing the old one). The old refresh token was deleted above.
+        const accessToken = await issueTokens(res, user);
+
+        res.status(200).json({
+            success: true,
+            message: 'Token refreshed successfully',
+            data: { accessToken },
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// SIGN OUT (was empty before)
+// POST /auth/sign-out
+// Signing out = delete the refresh token from the database + clear the cookie.
+// ---------------------------------------------------------------------------
 export const signOut = async (req, res, next) => {
+    try {
+        const token = req.cookies?.refreshToken;
 
-}
+        // If there is a cookie, delete its record from MongoDB. After this, /auth/refresh fails for that
+        // token, so the session can't be extended. We don't throw an error when there is no cookie:
+        // the user is already signed out, so the result they wanted is true either way.
+        if (typeof token === 'string') {
+            await RefreshToken.deleteOne({ tokenHash: hashToken(token) });
+        }
 
+        // Tell the browser to delete the cookie. It must use the same options it was set with
+        // (minus maxAge), otherwise the browser may keep it.
+        res.clearCookie('refreshToken', clearCookieOptions);
 
-/*export const getMe = (req, res) => {
+        // NOTE: the current access token still works until its 15 minutes run out.
+        // That is the trade-off of JWTs, and it is why access tokens are kept short.
+        res.status(200).json({
+            success: true,
+            message: 'Signed out successfully',
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+export const getMe = (req, res) => {
     // req.user was attached by authMiddleware, so we can just send it back
     res.json({ success: true, data: { user: req.user } });
-};*/
+};

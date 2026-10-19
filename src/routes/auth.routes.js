@@ -1,16 +1,27 @@
+// src/routes/auth.routes.js
 import { Router } from 'express';
 
-import { signIn, signUp, signOut, getMe } from "../controllers/auth.controller.js";
+// NEW: add `refresh` to this import. `signOut` was already exported
+// from the controller, but it was empty before, so check it's imported too.
+import { signUp, signIn, signOut, refresh, getMe } from '../controllers/auth.controller.js';
 
+// ...keep your other imports here (authMiddleware, rate limiter, validators...)
 import authMiddleware from '../middlewares/auth.middleware.js';
 
-const userAuthRouter = Router();
+const router = Router();
 
-userAuthRouter.post('/sign-in', signIn); // PATH : /api/auth/sign-in
-userAuthRouter.post('/sign-up', signUp); // PATH : /api/auth/sign-up
-userAuthRouter.post('/sign-out', signOut); // PATH : /api/auth/sign-out
+// ...keep your existing routes, for example:
+router.post('/sign-up', signUp);
+router.post('/sign-in', signIn);
 
-// tester
-userAuthRouter.get('/me', authMiddleware, getMe);   // authMiddleware runs first, then getMe
+// NEW: asks for a new access token using the refresh cookie.
+// It has no authMiddleware, because the access token is already expired when this is called.
+router.post('/refresh', refresh);
 
-export default userAuthRouter;
+// Make sure sign-out points to the real signOut controller.
+// It needs no authMiddleware either, because it works from the cookie.
+router.post('/sign-out', signOut);
+
+router.get('/me', authMiddleware, getMe); // keep as you have it
+
+export default router;
